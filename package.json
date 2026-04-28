@@ -1,0 +1,52 @@
+{
+  "name": "@alkdev/open-tasks",
+  "version": "0.1.0",
+  "description": "OpenCode plugin for structured task management with graph analysis, decomposition guidance, and workflow cost estimation.",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun --format esm && tsc --emitDeclarationOnly",
+    "lint": "bunx @biomejs/biome check .",
+    "format": "bunx @biomejs/biome format --write .",
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "author": "Alkimia Development",
+  "license": "(MIT OR Apache-2.0)",
+  "repository": {
+    "type": "git",
+    "url": "git@git.alk.dev:alkdev/open-tasks.git"
+  },
+  "files": [
+    "dist",
+    "LICENSE-MIT",
+    "LICENSE-APACHE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "opencode",
+    "plugin",
+    "tasks",
+    "taskgraph",
+    "dependency-analysis",
+    "decomposition"
+  ],
+  "dependencies": {
+    "@alkdev/taskgraph": "^0.0.1",
+    "@opencode-ai/plugin": "^1.1.3"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.2.0",
+    "@types/node": "^20.14.0",
+    "typescript": "^5.7.3"
+  }
+}
