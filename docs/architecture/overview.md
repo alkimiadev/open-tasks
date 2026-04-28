@@ -5,11 +5,23 @@ last_updated: 2026-04-28
 
 # Open Tasks: Architecture Overview
 
-Structured task management for OpenCode agents — graph analysis, dependency insight, decomposition guidance, and workflow cost estimation. Exposes a single `tasks` tool using a registry pattern to keep the agent's visible tool count minimal.
+Structured task management for OpenCode agents — graph analysis, dependency insight, decomposition guidance, and workflow cost estimation. Exposes a single `taskgraph` tool using a registry pattern to keep the agent's visible tool count minimal.
 
 ## Problem
 
 The `taskgraph` Rust CLI provides task graph operations but requires shell invocation — agents must compose bash commands and parse plain-text output. This is error-prone, context-expensive, and gives no structural validation or rich formatting. The TypeScript core library (`@alkdev/taskgraph`) now provides all graph operations natively. This plugin wraps that library into an OpenCode tool interface so agents get first-class, structured access without leaving the conversation.
+
+## Naming: `taskgraph` not `tasks`
+
+OpenCode has a built-in `task` tool that spawns subagents for work delegation. Naming our plugin `tasks` (plural) would create confusion — both deal with "tasks" but have completely different purposes:
+
+| Tool | Concept | Scope |
+|------|---------|-------|
+| `task` (built-in) | **Delegation** — spawn a subagent to do work | Session-scoped, ephemeral |
+| `todowrite` (built-in) | **Progress tracking** — what am I working on now | Session-scoped, flat list |
+| `taskgraph` (this plugin) | **Analysis** — what work exists, what depends on what, what's risky | Persistent, graph-structured |
+
+The name `taskgraph` directly matches the core library, clearly differentiates from the built-in `task`, and describes what the tool actually does. See [ADR-007](decisions/007-naming-taskgraph.md).
 
 ## What This Plugin Is
 
@@ -30,33 +42,35 @@ A **read-only analysis and query layer** on top of the project's `tasks/` direct
 
 ### Single-Tool Registry Pattern
 
-Following open-memory's proven approach, the plugin exposes **one tool** (`tasks`) with internal operation dispatch:
+Following open-memory's proven approach, the plugin exposes **one tool** (`taskgraph`) with internal operation dispatch:
 
 ```
-tasks({tool: "help"})                         → Show available operations
-tasks({tool: "list"})                         → List tasks in project
-tasks({tool: "show", args: {id: "..."}})      → Show task details
-tasks({tool: "deps", args: {id: "..."}})      → Task prerequisites
-tasks({tool: "dependents", args: {id: "..."}}) → Tasks depending on a task
-tasks({tool: "validate"})                      → Validate all task files
-tasks({tool: "topo"})                          → Topological ordering
-tasks({tool: "cycles"})                        → Circular dependency detection
-tasks({tool: "critical"})                      → Critical path
-tasks({tool: "parallel"})                      → Parallel execution groups
-tasks({tool: "bottleneck"})                  → Bottleneck analysis
-tasks({tool: "risk"})                           → Risk path + distribution
-tasks({tool: "cost"})                           → Workflow cost estimate
-tasks({tool: "decompose", args: {id: "..."}})  → Decomposition guidance
+taskgraph({op: "help"})                         → Show available operations
+taskgraph({op: "list"})                         → List tasks in project
+taskgraph({op: "show", args: {id: "..."}})      → Show task details
+taskgraph({op: "deps", args: {id: "..."}})      → Task prerequisites
+taskgraph({op: "dependents", args: {id: "..."}}) → Tasks depending on a task
+taskgraph({op: "validate"})                      → Validate all task files
+taskgraph({op: "topo"})                          → Topological ordering
+taskgraph({op: "cycles"})                        → Circular dependency detection
+taskgraph({op: "critical"})                      → Critical path
+taskgraph({op: "parallel"})                      → Parallel execution groups
+taskgraph({op: "bottleneck"})                  → Bottleneck analysis
+taskgraph({op: "risk"})                           → Risk path + distribution
+taskgraph({op: "cost"})                           → Workflow cost estimate
+taskgraph({op: "decompose", args: {id: "..."}})  → Decomposition guidance
 ```
 
 **Why**: Each tool definition adds JSON schema to the system prompt (~200-300 tokens each). 14 operations as 14 separate tools = ~3500 tokens of tool definitions. The registry pattern collapses this to ~250 tokens (one tool schema) plus an on-demand help text the agent retrieves only when needed. This is the same math that drove open-memory's design.
+
+**Why `op` instead of `tool`**: The dispatch field is named `op` (operation) rather than `tool` to avoid collision with OpenCode's own "tool" terminology. An agent calling `taskgraph({tool: "list"})` reads ambiguously — is "list" a tool or an operation on the taskgraph tool? `taskgraph({op: "list"})` is clearer: "run the list operation on the taskgraph."
 
 ### Component Structure
 
 ```
 src/
 ├── index.ts              # Plugin entry: tool registration + config loading
-├── tools.ts              # Tool definition — single `tasks` tool with registry dispatch
+├── tools.ts              # Tool definition — single `taskgraph` tool with registry dispatch
 ├── registry.ts           # Operation registry (dispatch table, arg validation)
 ├── config.ts             # Plugin config schema + resolution (TypeBox, validated)
 ├── sources/
@@ -206,7 +220,7 @@ class FileSource implements TaskSource {
     }
 
     const glob = new Bun.Glob("**/*.md")
-    const files = Array.from(glob.scanSync({ cwd: this.dirPath }))
+    const files = await Array.fromAsync(glob.scan({ cwd: this.dirPath }))
     // ... read each file, parse with parseFrontmatter, collect results
   }
 }
@@ -265,15 +279,15 @@ function createSource(config: Config, workspaceDir: string): TaskSource {
 
 ### Help Operation
 
-`tasks({tool: "help"})` returns the full operation reference table. `tasks({tool: "help", args: {tool: "list"}})` returns detailed usage for one operation including argument shapes and example calls.
+`taskgraph({op: "help"})` returns the full operation reference table. `taskgraph({op: "help", args: {op: "list"}})` returns detailed usage for one operation including argument shapes and example calls.
 
 ## Design Decisions
 
 ### D1: Registry Pattern (single tool, not 14)
 
 - **Context**: 14 operations could each be a separate tool or collapsed into one router.
-- **Choice**: Single `tasks` tool with `{tool, args}` dispatch.
-- **Consequences**: Agent always has access to the help reference. Adding operations never increases context bloat. Trade-off: the `tool` and `args` fields are not individually validated by the outer schema — validation happens inside the dispatch.
+- **Choice**: Single `taskgraph` tool with `{op, args}` dispatch.
+- **Consequences**: Agent always has access to the help reference. Adding operations never increases context bloat. Trade-off: the `op` and `args` fields are not individually validated by the outer schema — validation happens inside the dispatch.
 - **Reference**: See [ADR-001](decisions/001-registry-pattern.md)
 
 ### D2: No Caching, Fresh Graph Per Call
@@ -299,7 +313,7 @@ function createSource(config: Config, workspaceDir: string): TaskSource {
 ### D5: `cost` Defaults Match SDD Process
 
 - **Context**: `workflowCost()` supports `propagationMode` (independent vs dag-propagate), `defaultQualityRetention`, and `includeCompleted`. Different defaults make sense for different workflows.
-- **Choice**: Default to `propagationMode: "dag-propagate"`, `includeCompleted: false`, `defaultQualityRetention: 0.9` — matching the Spec-Driven Development (SDD) process's assumption that completed tasks are factored out of remaining cost, and that quality degrades probabilistically across dependencies. See [SDD Process](../../sdd_process.md) for the overall workflow.
+- **Choice**: Default to `propagationMode: "dag-propagate"`, `includeCompleted: false`, `defaultQualityRetention: 0.9` — matching the Spec-Driven Development (SDD) process's assumption that completed tasks are factored out of remaining cost, and that quality degrades probabilistically across dependencies. See [SDD Process](../sdd_process.md) for the overall workflow.
 - **Consequences**: The most common use case (active project planning) gets sensible defaults. Agents can override per-call.
 
 ### D6: Separate `registry.ts` From `tools.ts`
@@ -363,7 +377,9 @@ No hooks in v1. Future: task status injection into system prompt (similar to ope
 
 ### Tool Definition (`src/tools.ts`)
 
-Single tool with `{tool: string, args?: Record<string, unknown>}` schema. The `tool` field dispatches to an operation handler via the registry. Unknown tool names produce a friendly error directing to `tasks({tool: "help"})`.
+Single tool with `{op: string, args?: Record<string, unknown>}` schema. The `op` field dispatches to an operation handler via the registry. Unknown operation names produce a friendly error directing to `taskgraph({op: "help"})`.
+
+The tool's parameter schema uses **Zod** (from `@opencode-ai/plugin`'s `tool()` helper) because that's what OpenCode's plugin SDK provides for tool definitions. The plugin's internal config schema uses **TypeBox** for compile-time types and runtime `Value.Check()`. These are two different concerns: Zod for the tool's external interface (what the LLM sees), TypeBox for our own config (what we validate at startup).
 
 The `source` is passed from the plugin entry to `createTools()` and stored in the registry for all operations to use.
 
@@ -415,7 +431,7 @@ Operations encounter two categories of errors:
 
 ### Graph Errors (validation / cycles)
 
-- **Cycle detection**: The `cycles` operation surfaces all cycles. Operations that require topological ordering (topo, critical, parallel, cost) catch `CircularDependencyError` and return a message suggesting `tasks({tool: "cycles"})` first
+- **Cycle detection**: The `cycles` operation surfaces all cycles. Operations that require topological ordering (topo, critical, parallel, cost) catch `CircularDependencyError` and return a message suggesting `taskgraph({op: "cycles"})` first
 - **Validation errors**: The `validate` operation returns both schema errors (field-level: invalid enums, missing required fields) and graph errors (dangling references, duplicate edges). Other operations call `graph.validate()` only when structural correctness matters
 - **Task not found**: Operations that take a task `id` return a clear "not found" message listing the available task IDs (up to 20)
 
@@ -479,18 +495,24 @@ New operations can be added freely — the registry pattern means no schema bloa
 
 | Plugin | Relationship |
 |--------|-------------|
-| **open-memory** | Complementary — memory handles session introspection; tasks handles task graph analysis. Both use the registry pattern. |
-| **open-coordinator** | Downstream consumer — coordinator uses `tasks` to identify parallelizable work, then spawns worktrees. The `parallel` and `critical` operations inform coordination decisions. |
+| **open-memory** | Complementary — memory handles session introspection; taskgraph handles task graph analysis. Both use the registry pattern. |
+| **open-coordinator** | Future integration — coordinator's `spawn`/`swarm` could consume taskgraph's `parallel` and `critical` analysis for dependency-aware parallel execution. Currently no integration exists. |
 | **taskgraph CLI** | Functional equivalent — the Rust CLI and this plugin expose the same operations, but this plugin is native TypeScript + in-process, while the CLI is a separate binary. |
 | **@alkdev/taskgraph** | Core dependency — all graph operations. This plugin is a thin wrapper. |
+| **`task` (built-in)** | Distinct concept — spawns subagents for work delegation. `taskgraph` analyzes dependencies. Future: `task` could consume `taskgraph` analysis for smarter delegation, but these are complementary, not competing. See [ADR-007](decisions/007-naming-taskgraph.md). |
+| **`todowrite` (built-in)** | Complementary — session-scoped flat progress tracking. `taskgraph` operates on persistent graph-structured project files; `todowrite` tracks in-session ephemeral progress. No overlap. |
 
 ## Open Questions
 
-1. **Should `show` include the task's markdown body?** Task files can be long (especially with acceptance criteria and notes). Option A: always include full body. Option B: `show` returns frontmatter summary, `show --full` includes body. Recommendation: always include body — agents need the full context for implementation tasks, and `show` is on-demand (not in every call).
+1. ~~**Should `show` include the task's markdown body?**~~ **Resolved**: Yes. The `FileSource` provides `rawFiles` in `SourceResult`, and the `show` operation returns the full markdown body. This decision is locked in by the TaskSource design (ADR-005).
 
 2. **Should `cost` accept `--format json`?** The CLI supports JSON output for programmatic consumption. Since the plugin returns to an agent (not a script), markdown is always appropriate. JSON output is out of scope.
 
 3. **Future hook: task status injection?** Open-memory injects context percentage into the system prompt. Could open-tasks inject a brief task summary ("3 pending, 1 in-progress, 2 blocked")? This would require reading tasks on every message, which is cheap for small task sets but could be noisy. Defer to v2.
+
+4. **Future: taskgraph-aware execution?** Open-coordinator's `swarm`/`spawn` operations take arrays of task names but have no dependency awareness. A natural integration would let `taskgraph({op: "parallel"})` feed directly into coordinator's `swarm` — each parallel group becomes a wave of worktrees. Similarly, the built-in `task` tool's prompt could be enriched with dependency context from `taskgraph`. Both are v2+ concerns.
+
+5. **Should `TaskSource.load()` throw or capture errors in `SourceResult.errors`?** Per-file errors (malformed YAML, invalid schema) are captured in `errors`. Infrastructure errors (permission denied on the directory, disk failure) are thrown. This distinction needs to be documented in the `TaskSource` interface contract.
 
 ## References
 
@@ -498,5 +520,7 @@ New operations can be added freely — the registry pattern means no schema bloa
 - `@alkdev/taskgraph` README: local clone at `/workspace/@alkdev/taskgraph_ts/README.md`
 - open-memory architecture: `/workspace/@alkdev/open-memory/docs/architecture.md` (reference implementation for the registry pattern)
 - open-memory tools.ts: `/workspace/@alkdev/open-memory/src/tools.ts` (reference for handler pattern)
+- OpenCode `task` tool research: [../research/opencode-task-tool-deep-dive.md](../research/opencode-task-tool-deep-dive.md)
+- open-coordinator research: [../research/open-coordinator-deep-dive.md](../research/open-coordinator-deep-dive.md)
 - SDD process: [../sdd_process.md](../sdd_process.md)
 - OpenCode plugin SDK: `@opencode-ai/plugin` npm package

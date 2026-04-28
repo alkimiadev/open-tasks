@@ -2,12 +2,12 @@
 
 ## Project
 
-`@alkdev/open-tasks` — an OpenCode plugin that gives agents structured task management with graph analysis, decomposition guidance, and workflow cost estimation. Exposes a single `tasks` tool using a registry pattern (like open-memory and open-coordinator) to keep the agent's visible tool count minimal.
+`@alkdev/open-tasks` — an OpenCode plugin that gives agents structured task management with graph analysis, decomposition guidance, and workflow cost estimation. Exposes a single `taskgraph` tool using a registry pattern (like open-memory and open-coordinator) to keep the agent's visible tool count minimal.
 
 Part of the alk.dev trio:
 - **open-memory** (`memory` / `memory_compact`): session introspection, context awareness, history browsing
 - **open-coordinator** (`worktree`): git worktree orchestration, session spawning, anomaly detection
-- **open-tasks** (`tasks`): task graph management, dependency analysis, decomposition guidance
+- **open-tasks** (`taskgraph`): task graph analysis, dependency insight, decomposition guidance
 
 ## Repository
 
@@ -38,7 +38,7 @@ The graph operations, risk scoring, frontmatter parsing, and analysis functions 
 
 Key imports from `@alkdev/taskgraph`:
 - `TaskGraph` — primary graph data structure (construction, queries, mutation, export)
-- `parseTaskFile`, `parseTaskDirectory`, `parseFrontmatter`, `serializeFrontmatter` — YAML frontmatter I/O
+- `parseFrontmatter`, `serializeFrontmatter` — YAML frontmatter I/O (we use `parseFrontmatter` directly; directory scanning uses Bun.Glob per ADR-006)
 - `criticalPath`, `weightedCriticalPath`, `parallelGroups`, `bottlenecks` — analysis functions
 - `riskPath`, `riskDistribution`, `calculateTaskEv`, `workflowCost` — risk & cost analysis
 - `shouldDecomposeTask` — decomposition guidance
@@ -46,24 +46,26 @@ Key imports from `@alkdev/taskgraph`:
 
 ### Plugin Design: Registry Pattern
 
-Like open-memory, this plugin exposes **one tool** (`tasks`) with internal operation dispatch. This keeps the agent's visible tool count low.
+Like open-memory, this plugin exposes **one tool** (`taskgraph`) with internal operation dispatch. This keeps the agent's visible tool count low.
 
 ```
-tasks({tool: "help"})                    → Show available operations
-tasks({tool: "list"})                    → List tasks in project
-tasks({tool: "show", args: {id: "..."}}) → Show task details
-tasks({tool: "deps", args: {id: "..."}}) → Show task prerequisites
-tasks({tool: "dependents", args: {id: "..."}}) → Show tasks that depend on a task
-tasks({tool: "validate"})                → Validate all task files
+taskgraph({op: "help"})                         → Show available operations
+taskgraph({op: "list"})                         → List tasks in project
+taskgraph({op: "show", args: {id: "..."}})      → Show task details
+taskgraph({op: "deps", args: {id: "..."}})      → Show task prerequisites
+taskgraph({op: "dependents", args: {id: "..."}}) → Show tasks that depend on a task
+taskgraph({op: "validate"})                      → Validate all task files
 ... etc
 ```
+
+The dispatch field is `op` (operation) rather than `tool` — this avoids confusion with OpenCode's "tool" concept and matches the Rust CLI's subcommand pattern (`taskgraph parallel`, `taskgraph critical`).
 
 ### Source Structure
 
 ```
 src/
 ├── index.ts              # Plugin entry: config resolution + tool registration
-├── tools.ts              # Tool definitions (tasks router)
+├── tools.ts              # Tool definitions (taskgraph router)
 ├── registry.ts           # Operation registry pattern (dispatch by tool name)
 ├── config.ts             # Plugin config schema (TypeBox, validated)
 ├── sources/
@@ -94,9 +96,7 @@ src/
 |------|---------|
 | None initial — future: task status injection into system prompt, worktree-aware task context |
 
-### The `tasks` Tool
-
-Single tool with `{tool, args}` dispatch. The `help` operation provides full reference with examples, following the pattern from open-memory's `memory({tool: "help"})`.
+### The `taskgraph` Tool
 
 Operations map to `@alkdev/taskgraph` functions, reading tasks from a `TaskSource` (v1: `FileSource` via `Bun.Glob` + `parseFrontmatter`) and returning formatted output.
 
