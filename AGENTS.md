@@ -52,7 +52,8 @@ Like open-memory, this plugin exposes **one tool** (`tasks`) with internal opera
 tasks({tool: "help"})                    → Show available operations
 tasks({tool: "list"})                    → List tasks in project
 tasks({tool: "show", args: {id: "..."}}) → Show task details
-tasks({tool: "deps", args: {id: "..."}}) → Show task dependencies
+tasks({tool: "deps", args: {id: "..."}}) → Show task prerequisites
+tasks({tool: "dependents", args: {id: "..."}}) → Show tasks that depend on a task
 tasks({tool: "validate"})                → Validate all task files
 ... etc
 ```
@@ -61,7 +62,7 @@ tasks({tool: "validate"})                → Validate all task files
 
 ```
 src/
-├── index.ts          # Plugin entry: hooks + tool registration
+├── index.ts          # Plugin entry: tool registration (no hooks in v1)
 ├── tools.ts          # Tool definitions (tasks router)
 ├── registry.ts       # Operation registry pattern (dispatch by tool name)
 ├── operations/       # Individual operation implementations
@@ -140,7 +141,7 @@ Tasks are markdown files in `tasks/` with YAML frontmatter:
 id: auth-setup
 name: Setup Authentication
 status: pending
-depends_on: []
+dependsOn: []
 scope: moderate
 risk: medium
 impact: component
@@ -164,6 +165,8 @@ Implement OAuth2 authentication with provider abstraction.
 
 > Agent fills this on completion.
 ```
+
+> **Note on field naming**: The `@alkdev/taskgraph` library uses camelCase (`dependsOn`, `scope`, `risk`, etc.) in its schema. The Rust CLI historically used snake_case (`depends_on`). As of `@alkdev/taskgraph` v0.0.2, the parser accepts both forms — but camelCase is the canonical form for new files.
 
 ## Build & Test Commands
 
