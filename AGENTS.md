@@ -62,17 +62,30 @@ tasks({tool: "validate"})                → Validate all task files
 
 ```
 src/
-├── index.ts          # Plugin entry: tool registration (no hooks in v1)
-├── tools.ts          # Tool definitions (tasks router)
-├── registry.ts       # Operation registry pattern (dispatch by tool name)
-├── operations/       # Individual operation implementations
+├── index.ts              # Plugin entry: config resolution + tool registration
+├── tools.ts              # Tool definitions (tasks router)
+├── registry.ts           # Operation registry pattern (dispatch by tool name)
+├── config.ts             # Plugin config schema (TypeBox, validated)
+├── sources/
+│   ├── types.ts          # TaskSource interface, SourceResult, SourceError
+│   ├── file-source.ts    # FileSource — reads tasks/ via Bun.Glob + parseFrontmatter
+│   └── index.ts          # Source factory: resolves config → TaskSource
+├── operations/            # Individual operation implementations
 │   ├── help.ts
 │   ├── list.ts
 │   ├── show.ts
 │   ├── deps.ts
+│   ├── dependents.ts
 │   ├── validate.ts
-│   └── ... (analysis operations)
-└── formatting.ts     # Output formatting helpers
+│   ├── topo.ts
+│   ├── cycles.ts
+│   ├── critical.ts
+│   ├── parallel.ts
+│   ├── bottleneck.ts
+│   ├── risk.ts
+│   ├── cost.ts
+│   └── decompose.ts
+└── formatting.ts          # Output formatting helpers
 ```
 
 ### Plugin Hooks
@@ -85,7 +98,25 @@ src/
 
 Single tool with `{tool, args}` dispatch. The `help` operation provides full reference with examples, following the pattern from open-memory's `memory({tool: "help"})`.
 
-Operations map to `@alkdev/taskgraph` functions, reading tasks from the project's `tasks/` directory and returning formatted output.
+Operations map to `@alkdev/taskgraph` functions, reading tasks from a `TaskSource` (v1: `FileSource` via `Bun.Glob` + `parseFrontmatter`) and returning formatted output.
+
+## Plugin Config
+
+Optional config via `opencode.json`:
+
+```jsonc
+{
+  "plugin": [
+    ["@alkdev/open-tasks", {
+      "tasksPath": "tasks"  // relative to workspace root (default: "tasks")
+    }]
+  ]
+}
+```
+
+If no config is provided, defaults to `"tasks"` (a `tasks/` directory relative to workspace root). Config is validated at runtime using TypeBox + `Value.Check`.
+
+The `TaskSource` abstraction means operations never touch the filesystem directly — they call `source.load()`. This makes future sources (API endpoints, databases) swappable without changing any operation logic.
 
 ## Local Development & Testing
 

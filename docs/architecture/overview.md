@@ -55,9 +55,14 @@ tasks({tool: "decompose", args: {id: "..."}})  → Decomposition guidance
 
 ```
 src/
-├── index.ts              # Plugin entry: tool registration (no hooks in v1)
+├── index.ts              # Plugin entry: tool registration + config loading
 ├── tools.ts              # Tool definition — single `tasks` tool with registry dispatch
 ├── registry.ts           # Operation registry (dispatch table, arg validation)
+├── config.ts             # Plugin config schema + resolution (TypeBox, validated)
+├── sources/
+│   ├── types.ts          # TaskSource interface
+│   ├── file-source.ts    # FileSource — reads tasks/ directory via Bun.Glob + parseFrontmatter
+│   └── index.ts          # Source factory: resolves config → TaskSource
 ├── operations/            # Individual operation implementations
 │   ├── help.ts            # Help reference and per-operation details
 │   ├── list.ts            # List and filter tasks
@@ -76,6 +81,103 @@ src/
 └── formatting.ts          # Shared markdown formatting helpers
 ```
 
+### Plugin Configuration
+
+The plugin reads optional configuration from `opencode.json` under the plugin entry:
+
+```jsonc
+// opencode.json
+{
+  "plugin": [
+    ["@alkdev/open-tasks", {
+      "tasksPath": "tasks"  // relative to workspace root (default: "tasks")
+    }]
+  ]
+}
+```
+
+If no config is provided, the plugin defaults to `"tasks"` (a `tasks/` directory relative to the workspace root).
+
+The config schema uses TypeBox (already a dependency via `@alkdev/taskgraph`), giving us:
+
+- **Compile-time types** — `Static<typeof ConfigSchema>` for TypeScript inference
+- **Runtime validation** — `Value.Check(ConfigSchema, configObj)` to reject invalid config
+- **JSON Schema export** — for tooling/IDE support
+
+```typescript
+import { Type, type Static } from "@alkdev/typebox"
+
+export const ConfigSchema = Type.Object({
+  tasksPath: Type.Optional(Type.String({ default: "tasks" })),
+})
+
+export type Config = Static<typeof ConfigSchema>
+```
+
+This minimal schema is forward-looking. Future sources (API endpoints, databases) will add their own config keys.
+
+### TaskSource Abstraction
+
+Operations don't read the filesystem directly. They go through a `TaskSource` interface:
+
+```typescript
+interface TaskSource {
+  /** Human-readable description for error messages */
+  readonly name: string
+
+  /** Load all tasks, returning parsed TaskInput[] and raw file data */
+  load(): Promise<SourceResult>
+}
+
+interface SourceResult {
+  tasks: TaskInput[]           // parsed frontmatter from @alkdev/taskgraph
+  rawFiles: Map<string, string> // taskId → full file content (for `show` operation)
+  errors: SourceError[]         // files that failed to parse
+}
+
+interface SourceError {
+  filePath: string
+  error: string
+}
+```
+
+**Why an interface?** v1 only has `FileSource` (reads from `tasks/` directory). But the abstraction makes it trivial to add:
+
+- **ApiSource** — tasks fetched from a remote endpoint (future: project management tools, CI dashboards)
+- **MixedSource** — merge multiple sources with precedence rules
+- **TestSource** — in-memory tasks for unit testing operations without filesystem
+
+Each source implements `load()` and returns the same shape. Operations receive a `SourceResult` and work with it — they never know (or care) where the data came from. This is the same pattern that makes the `tool` tool in open-memory work with SQLite but be testable with in-memory data.
+
+### FileSource Implementation
+
+The v1 concrete source reads markdown files from a directory:
+
+```typescript
+class FileSource implements TaskSource {
+  readonly name: string
+
+  constructor(private dirPath: string) {
+    this.name = `FileSource(${dirPath})`
+  }
+
+  async load(): Promise<SourceResult> {
+    const glob = new Bun.Glob("**/*.md")
+    const files = Array.from(glob.scanSync({ cwd: this.dirPath }))
+    // ... read each file, parse with parseFrontmatter, collect results
+  }
+}
+```
+
+**Why Bun.Glob instead of `parseTaskDirectory`?** The library's `parseTaskDirectory` uses `node:fs/promises.readdir` recursively and silently skips files with invalid frontmatter. We use `Bun.Glob` instead because:
+
+1. **We need raw file content** — the `show` operation returns the full markdown body, not just frontmatter. `parseTaskDirectory` only returns parsed `TaskInput` objects; we'd need a separate pass to read file contents.
+2. **We need error detail** — `parseTaskDirectory` silently skips invalid files. We need to surface parse errors with filenames so the `validate` operation can report them.
+3. **Single-pass I/O** — `Bun.Glob` gives us file paths, then we read each file once with `Bun.file()` and parse with `parseFrontmatter`. One I/O pass, not two.
+4. **Consistent runtime** — the plugin targets Bun. `Bun.Glob` and `Bun.file()` are the native APIs; no reason to use Node compat shims.
+
+The library's `parseFrontmatter` (singular) is still the right tool for parsing individual file content. We just replace the directory-scanning and file-reading parts.
+
 ### Data Flow
 
 Each operation follows the same pipeline:
@@ -87,11 +189,9 @@ Agent calls tasks({tool: "list", args: {status: "pending"}})
   │
   ├─ Operation handler:
   │   │
-  │   ├─ resolveTasksPath(ctx) → find project's tasks/ directory
+  │   ├─ source.load() → SourceResult (tasks, rawFiles, errors)
   │   │
-  │   ├─ parseTaskDirectory(tasksPath) → TaskInput[] from @alkdev/taskgraph
-  │   │
-  │   ├─ TaskGraph.fromTasks(inputs) → in-memory graph
+  │   ├─ TaskGraph.fromTasks(sourceResult.tasks) → in-memory graph
   │   │
   │   ├─ Analysis function (e.g., parallelGroups(graph))
   │   │
@@ -100,18 +200,17 @@ Agent calls tasks({tool: "list", args: {status: "pending"}})
   └─ Return formatted markdown to agent
 ```
 
-There is no caching between calls. Each invocation reads files and builds a fresh graph. This is intentional — task files change as agents work, and stale data would be worse than redundant I/O.
+The `source` is resolved once at plugin initialization (in `index.ts`) and passed to all operation handlers via the registry. Operations call `source.load()` to get fresh data — no caching between calls.
 
-### Task Discovery
+### Path Resolution
 
-The plugin needs to find the project's `tasks/` directory. Resolution order:
+The plugin resolves its tasks directory from config with safe defaults:
 
-1. **Workspace root** — `<workspace>/tasks/` (where `workspace` comes from the OpenCode plugin context)
-2. **Fallback** — `./tasks/` relative to CWD
+1. **Config** — `tasksPath` from plugin config (if provided). Treated as relative to workspace root. Path traversal is rejected.
+2. **Default** — `tasks/` relative to workspace root (from `ctx.directory` in `PluginInput`).
+3. **No config, no directory** — operations return a clear message explaining how to create a `tasks/` directory.
 
-The path is constrained: it must resolve to a directory named `tasks/` within the workspace. If a config-provided path escapes the workspace root (e.g., `../../etc/`), it is rejected. This prevents the plugin from reading arbitrary files outside the project.
-
-If no tasks directory is found, operations return a clear error message explaining where they looked and how to create one.
+There is no CWD fallback. The workspace root from the OpenCode plugin context is the authoritative base path.
 
 ## Operations Reference
 
@@ -183,18 +282,46 @@ If no tasks directory is found, operations return a clear error message explaini
 - **Choice**: `tools.ts` defines the tool schema and dispatch. `registry.ts` maps operation names to handler functions. Each operation is a separate file under `operations/`.
 - **Consequences**: Each operation is independently understandable and testable. Adding a new operation means adding one file and one registry entry, not editing a growing monolith.
 
+### D7: TaskSource Abstraction
+
+- **Context**: v1 reads tasks from a local `tasks/` directory. Future sources could include API endpoints, databases, or remote project management tools. Hardcoding file I/O in each operation would make this evolution painful.
+- **Choice**: Define a `TaskSource` interface with a single `load()` method returning `SourceResult { tasks, rawFiles, errors }`. v1 implements `FileSource` (reads from filesystem). The source is resolved once at plugin initialization and passed to all operations.
+- **Consequences**: Operations are decoupled from I/O. `FileSource` uses `Bun.Glob` for discovery and `parseFrontmatter` for parsing. Future `ApiSource` would swap in a fetch call. Test sources can provide in-memory data. The `show` operation gets raw file content via `rawFiles` — no second I/O pass needed.
+
+### D8: Bun.Glob Over `parseTaskDirectory`
+
+- **Context**: `@alkdev/taskgraph` provides `parseTaskFile` and `parseTaskDirectory` for file I/O. However, `parseTaskDirectory` silently skips invalid files and returns only `TaskInput[]` — no raw content, no error detail.
+- **Choice**: Use `Bun.Glob("**/*.md")` for directory scanning, `Bun.file()` for reading, and `parseFrontmatter()` (singular) for parsing. The `show` operation needs full markdown content (not just frontmatter), and `validate` needs to report filenames with errors.
+- **Consequences**: Single I/O pass per call. We get raw file content for `show`, error detail for `validate`, and the same `parseFrontmatter` parsing we'd get from the library. The library is still the dependency for `parseFrontmatter`, `TaskGraph`, and all analysis — we just don't use its directory-scanning convenience function.
+
 ## Interfaces
 
 ### Plugin Entry (`src/index.ts`)
 
 ```typescript
-import type { Plugin } from "@opencode-ai/plugin"
+import type { Plugin, PluginOptions } from "@opencode-ai/plugin"
+import { Value } from "@alkdev/typebox/value"
+import { ConfigSchema, type Config } from "./config.js"
+import { createSource } from "./sources/index.js"
 import { createTools } from "./tools.js"
 
-const OpenTasksPlugin: Plugin = async (ctx) => {
+const OpenTasksPlugin: Plugin = async (ctx, options) => {
+  const config = resolveConfig(options)
+  const source = createSource(config, ctx.directory)
+
   return {
-    tool: createTools(ctx),
+    tool: createTools(ctx, source),
   }
+}
+
+function resolveConfig(options?: PluginOptions): Config {
+  if (options && Object.keys(options).length > 0) {
+    if (!Value.Check(ConfigSchema, options)) {
+      // Log warning, fall back to defaults
+    }
+    return Value.Cast(ConfigSchema, options) as Config
+  }
+  return { tasksPath: "tasks" }
 }
 
 export default OpenTasksPlugin
@@ -206,20 +333,22 @@ No hooks in v1. Future: task status injection into system prompt (similar to ope
 
 Single tool with `{tool: string, args?: Record<string, unknown>}` schema. The `tool` field dispatches to an operation handler via the registry. Unknown tool names produce a friendly error directing to `tasks({tool: "help"})`.
 
+The `source` is passed from the plugin entry to `createTools()` and stored in the registry for all operations to use.
+
 ### Operation Handler Signature
 
 ```typescript
 import type { PluginInput } from "@opencode-ai/plugin"
+import type { TaskSource } from "./sources/types.js"
 
 type OperationHandler = (
   args: Record<string, unknown>,
+  source: TaskSource,
   ctx: PluginInput,
 ) => string | Promise<string>
 ```
 
-Each handler receives raw args (already validated by the handler itself) and the plugin context. `PluginInput` provides workspace path information needed by `resolveTasksPath()`. Returns formatted markdown string.
-
-`resolveTasksPath(ctx)` in the registry handles path resolution and returns the absolute path to the tasks directory. Operations should call this rather than hardcoding paths.
+Each handler receives raw args (validated by the handler itself), the `TaskSource` for loading task data, and the plugin context. `PluginInput` provides `directory` (workspace root) and `worktree` path. Returns formatted markdown string.
 
 ## Compatibility Surface
 
@@ -232,13 +361,14 @@ The broader lesson remains: **issues upstream increase the surface area of issue
 ## Constraints
 
 1. **Read-only** — the plugin never writes to the filesystem. Task mutations happen through Write/Edit tools.
-2. **No network** — the plugin makes no HTTP calls. All data comes from local task files.
+2. **No network in v1** — FileSource reads local files only. The TaskSource abstraction makes future network sources possible but v1 has no ApiSource.
 3. **No state between calls** — each invocation is independent. No caching, no session storage.
-4. **Task files are the source of truth** — markdown files in `tasks/` directory. No database, no alternative storage.
-5. **Depends on `@alkdev/taskgraph`** — all graph construction, analysis, and frontmatter parsing comes from the core library. This plugin is a thin consumer. Contract changes in the library (field naming, schema changes) propagate here — see [Compatibility Surface](#compatibility-surface).
+4. **Task files are the source of truth** — markdown files in `tasks/` directory (or configured path). No database, no alternative storage in v1.
+5. **Depends on `@alkdev/taskgraph`** — all graph construction and frontmatter parsing comes from the core library. This plugin provides the I/O layer, config, and formatting. Contract changes in the library (field naming, schema changes) propagate here — see [Compatibility Surface](#compatibility-surface).
 6. **Task directory required** — operations fail gracefully if no `tasks/` directory is found, returning a clear message about where to create one.
 7. **Circular dependency handling** — if `TaskGraph.fromTasks()` detects cycles via the `topologicalOrder()` path, the `cycles` operation surfaces the cycle details. Other operations that rely on topological ordering (topo, critical, parallel, cost) report the error and suggest running `cycles` first.
 8. **Frontmatter key normalization resolved** — `@alkdev/taskgraph` v0.0.2+ accepts both `depends_on` and `dependsOn` in YAML frontmatter. The plugin pins `^0.0.2`. See [ADR-004](decisions/004-frontmatter-field-normalization.md) and [Compatibility Surface](#compatibility-surface).
+9. **Operations never touch the filesystem directly** — they go through `TaskSource.load()`. This enforces the read-only constraint and makes operations testable with in-memory sources.
 
 ## Error Handling
 
@@ -274,6 +404,15 @@ Each operation should complete within these targets (assumes ≤50 task files):
 | `decompose` | <200ms | Single task lookup + check |
 
 At 100+ files, expect 2-3x slowdown. The dominant cost is file I/O (reading and parsing YAML), not graph algorithms.
+
+**Benchmark data** (43 tasks, all analysis functions, Bun runtime):
+- Glob scan (`Bun.Glob`): ~1ms
+- File read + parse (`parseFrontmatter` per file): ~140ms
+- Graph construction (`TaskGraph.fromTasks`): ~5ms
+- All six analysis functions combined: ~17ms
+- **Total pipeline**: ~150ms
+
+The Rust CLI is faster on raw file I/O and YAML parsing (native binary, no JS overhead), but the plugin wins on overall call latency — no subprocess spawn, no plain-text parsing by the LLM, no context-wasting bash composition. The ~150ms is well within agent tool call budgets.
 
 ## Versioning
 
