@@ -102,21 +102,34 @@ Operations map to `@alkdev/taskgraph` functions, reading tasks from a `TaskSourc
 
 ## Plugin Config
 
-Optional config via `opencode.json`:
+Optional config via `opencode.json`. OpenCode passes the raw options object to the plugin — the plugin validates with TypeBox at startup.
 
 ```jsonc
+// No config = default FileSource("tasks"), silent if directory missing
+{
+  "plugin": ["@alkdev/open-tasks"]
+}
+
+// Explicit file source with custom path
 {
   "plugin": [
     ["@alkdev/open-tasks", {
-      "tasksPath": "tasks"  // relative to workspace root (default: "tasks")
+      "source": { "type": "file", "tasksPath": "docs/tasks" }
     }]
   ]
 }
+
+// Future: API source (secrets via env vars, not config)
+// {
+//   "plugin": [
+//     ["@alkdev/open-tasks", {
+//       "source": { "type": "api", "url": "https://api.example.com/tasks" }
+//     }]
+//   ]
+// }
 ```
 
-If no config is provided, defaults to `"tasks"` (a `tasks/` directory relative to workspace root). Config is validated at runtime using TypeBox + `Value.Check`.
-
-The `TaskSource` abstraction means operations never touch the filesystem directly — they call `source.load()`. This makes future sources (API endpoints, databases) swappable without changing any operation logic.
+The `source.type` field is a discriminated union — each source type has its own config shape. Defaults to `{ type: "file", tasksPath: "tasks" }` if no config is provided. Secrets (API keys) come from environment variables, not config files.
 
 ## Local Development & Testing
 

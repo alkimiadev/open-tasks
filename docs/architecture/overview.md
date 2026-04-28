@@ -83,38 +83,76 @@ src/
 
 ### Plugin Configuration
 
-The plugin reads optional configuration from `opencode.json` under the plugin entry:
+OpenCode passes plugin options as a raw `Record<string, unknown>` directly from the `opencode.json` config tuple. There is no OpenCode-side validation — the plugin receives exactly what was in the config file. This means:
+
+- The plugin validates its own config using TypeBox + `Value.Check()` at startup
+- Invalid config produces a clear error and falls back to defaults
+- No extra config files needed — everything lives in `opencode.json`
 
 ```jsonc
-// opencode.json
+// No config = default FileSource("tasks"), do nothing if directory doesn't exist
+{
+  "plugin": ["@alkdev/open-tasks"]
+}
+
+// Explicit file source with custom path
 {
   "plugin": [
     ["@alkdev/open-tasks", {
-      "tasksPath": "tasks"  // relative to workspace root (default: "tasks")
+      "source": { "type": "file", "tasksPath": "docs/tasks" }
     }]
   ]
 }
+
+// Future example: API source (secrets via env vars, not config)
+// {
+//   "plugin": [
+//     ["@alkdev/open-tasks", {
+//       "source": { "type": "api", "url": "https://api.example.com/tasks" }
+//     }]
+//   ]
+// }
 ```
 
-If no config is provided, the plugin defaults to `"tasks"` (a `tasks/` directory relative to the workspace root).
+### Config Behavior
 
-The config schema uses TypeBox (already a dependency via `@alkdev/taskgraph`), giving us:
+- **No config or no `source` key** → FileSource with `tasksPath: "tasks"`. If the directory doesn't exist, operations return an empty/graceful result rather than an error. The plugin does nothing silently — no crash, no noise.
+- **`source` provided** → Factory resolves `source.type` to the matching TaskSource implementation. Unknown types produce a clear error at startup.
+- **Secrets** (future API keys, tokens) are never stored in config files (which are committed to git). They come from environment variables at runtime (e.g., `TASKGRAPH_API_KEY`). Config holds only non-sensitive connection parameters (URLs, paths).
 
-- **Compile-time types** — `Static<typeof ConfigSchema>` for TypeScript inference
-- **Runtime validation** — `Value.Check(ConfigSchema, configObj)` to reject invalid config
-- **JSON Schema export** — for tooling/IDE support
+The `source.type` field is a discriminated union key. Each source type has its own config shape — one type, one set of properties. This avoids the flat "add more keys" anti-pattern where every new source type adds nullable fields to a growing config object.
+
+### Config Schema
 
 ```typescript
-import { Type, type Static } from "@alkdev/typebox"
+import { Type, type Static, Union, Literal, Object, String, Optional } from "@alkdev/typebox"
+
+const FileSourceConfig = Type.Object({
+  type: Type.Literal("file"),
+  tasksPath: Type.Optional(Type.String({ default: "tasks", description: "Relative to workspace root" })),
+})
+
+const ApiSourceConfig = Type.Object({
+  type: Type.Literal("api"),
+  url: Type.String({ description: "Endpoint URL" }),
+  // API keys read from env vars: TASKGRAPH_API_KEY
+  // Not stored in config (committed to git)
+})
+
+export const SourceConfigSchema = Type.Union([FileSourceConfig, ApiSourceConfig])
 
 export const ConfigSchema = Type.Object({
-  tasksPath: Type.Optional(Type.String({ default: "tasks" })),
+  source: Type.Optional(SourceConfigSchema),  // defaults to FileSource("tasks")
 })
 
 export type Config = Static<typeof ConfigSchema>
+export type SourceConfig = Static<typeof SourceConfigSchema>
 ```
 
-This minimal schema is forward-looking. Future sources (API endpoints, databases) will add their own config keys.
+TypeBox gives us:
+- **Compile-time types** — `Static<typeof ConfigSchema>` for TypeScript inference, discriminated union on `source.type`
+- **Runtime validation** — `Value.Check(ConfigSchema, configObj)` rejects invalid config at startup
+- **JSON Schema export** — `Value.Convert()` applies defaults, IDE autocomplete via `$schema`
 
 ### TaskSource Abstraction
 
@@ -162,6 +200,11 @@ class FileSource implements TaskSource {
   }
 
   async load(): Promise<SourceResult> {
+    // If directory doesn't exist, return empty result (not an error)
+    if (!existsSync(this.dirPath)) {
+      return { tasks: [], rawFiles: new Map(), errors: [] }
+    }
+
     const glob = new Bun.Glob("**/*.md")
     const files = Array.from(glob.scanSync({ cwd: this.dirPath }))
     // ... read each file, parse with parseFrontmatter, collect results
@@ -169,48 +212,31 @@ class FileSource implements TaskSource {
 }
 ```
 
-**Why Bun.Glob instead of `parseTaskDirectory`?** The library's `parseTaskDirectory` uses `node:fs/promises.readdir` recursively and silently skips files with invalid frontmatter. We use `Bun.Glob` instead because:
+**Key behavior**: if the configured directory doesn't exist, `FileSource.load()` returns an empty `SourceResult` — no crash, no error. Operations that receive an empty task set produce a clear message ("No tasks found in `<path>`. Create a `tasks/` directory..."). This means the plugin is safe to install without setting anything up — it just does nothing until task files appear.
 
-1. **We need raw file content** — the `show` operation returns the full markdown body, not just frontmatter. `parseTaskDirectory` only returns parsed `TaskInput` objects; we'd need a separate pass to read file contents.
-2. **We need error detail** — `parseTaskDirectory` silently skips invalid files. We need to surface parse errors with filenames so the `validate` operation can report them.
-3. **Single-pass I/O** — `Bun.Glob` gives us file paths, then we read each file once with `Bun.file()` and parse with `parseFrontmatter`. One I/O pass, not two.
-4. **Consistent runtime** — the plugin targets Bun. `Bun.Glob` and `Bun.file()` are the native APIs; no reason to use Node compat shims.
+**Path resolution** for FileSource:
 
-The library's `parseFrontmatter` (singular) is still the right tool for parsing individual file content. We just replace the directory-scanning and file-reading parts.
+1. **Config `tasksPath`** — if provided, treated as relative to workspace root (from `ctx.directory` in `PluginInput`). Path traversal (`../../etc/`) is rejected.
+2. **Default** — `"tasks"` relative to workspace root.
+3. **Directory missing** — returns empty result, operations explain how to create one.
 
-### Data Flow
+No CWD fallback. The workspace root from the OpenCode plugin context is the authoritative base path.
 
-Each operation follows the same pipeline:
+### Source Factory
 
+```typescript
+function createSource(config: Config, workspaceDir: string): TaskSource {
+  switch (config.source?.type) {
+    case "file":
+    case undefined:  // default
+      return new FileSource(resolve(workspaceDir, config.source?.tasksPath ?? "tasks"))
+    case "api":
+      return new ApiSource(config.source)  // future
+    default:
+      throw new Error(`Unknown source type: ${config.source?.type}`)
+  }
+}
 ```
-Agent calls tasks({tool: "list", args: {status: "pending"}})
-  │
-  ├─ registry.ts validates tool name and args
-  │
-  ├─ Operation handler:
-  │   │
-  │   ├─ source.load() → SourceResult (tasks, rawFiles, errors)
-  │   │
-  │   ├─ TaskGraph.fromTasks(sourceResult.tasks) → in-memory graph
-  │   │
-  │   ├─ Analysis function (e.g., parallelGroups(graph))
-  │   │
-  │   └─ format result as markdown
-  │
-  └─ Return formatted markdown to agent
-```
-
-The `source` is resolved once at plugin initialization (in `index.ts`) and passed to all operation handlers via the registry. Operations call `source.load()` to get fresh data — no caching between calls.
-
-### Path Resolution
-
-The plugin resolves its tasks directory from config with safe defaults:
-
-1. **Config** — `tasksPath` from plugin config (if provided). Treated as relative to workspace root. Path traversal is rejected.
-2. **Default** — `tasks/` relative to workspace root (from `ctx.directory` in `PluginInput`).
-3. **No config, no directory** — operations return a clear message explaining how to create a `tasks/` directory.
-
-There is no CWD fallback. The workspace root from the OpenCode plugin context is the authoritative base path.
 
 ## Operations Reference
 
@@ -314,14 +340,20 @@ const OpenTasksPlugin: Plugin = async (ctx, options) => {
   }
 }
 
+// OpenCode passes the raw JSON object from opencode.json as PluginOptions.
+// It's Record<string, unknown> — untyped. We validate with TypeBox and apply defaults.
 function resolveConfig(options?: PluginOptions): Config {
   if (options && Object.keys(options).length > 0) {
+    // Validate against our schema. If invalid, log a warning and fall back to defaults.
     if (!Value.Check(ConfigSchema, options)) {
-      // Log warning, fall back to defaults
+      console.warn("@alkdev/open-tasks: invalid config, using defaults", {
+        errors: [...Value.Errors(ConfigSchema, options)],
+      })
+      return { source: { type: "file", tasksPath: "tasks" } }
     }
     return Value.Cast(ConfigSchema, options) as Config
   }
-  return { tasksPath: "tasks" }
+  return { source: { type: "file", tasksPath: "tasks" } }
 }
 
 export default OpenTasksPlugin
