@@ -379,7 +379,14 @@ No hooks in v1. Future: task status injection into system prompt (similar to ope
 
 Single tool with `{op: string, args?: Record<string, unknown>}` schema. The `op` field dispatches to an operation handler via the registry. Unknown operation names produce a friendly error directing to `taskgraph({op: "help"})`.
 
-The tool's parameter schema uses **Zod** (from `@opencode-ai/plugin`'s `tool()` helper) because that's what OpenCode's plugin SDK provides for tool definitions. The plugin's internal config schema uses **TypeBox** for compile-time types and runtime `Value.Check()`. These are two different concerns: Zod for the tool's external interface (what the LLM sees), TypeBox for our own config (what we validate at startup).
+**Zod is required for the tool args schema.** OpenCode's plugin SDK defines `tool()` with `args: z.ZodRawShape`, and OpenCode's registry does `z.object(def.args)` to construct the parameter schema. There is no JSON Schema escape hatch — Zod is the only option for tool definitions. This is a small surface area (one schema for one tool), not a design choice.
+
+The plugin's internal config validation uses **TypeBox** (`@alkdev/typebox/value`) for `Value.Check()` and `Value.Cast()`. These are two different concerns at two different layers:
+
+| Layer | Concern | Library | Why |
+|-------|----------|---------|-----|
+| Tool definition (what the LLM sees) | Parameter schema for `taskgraph({op, args})` | Zod | Required by OpenCode's registry — it calls `z.object(def.args)` |
+| Plugin config (what opencode.json provides) | Validate and apply defaults to `{source: {type, tasksPath}}` | TypeBox | Better JSON Schema ergonomics, already a dependency, matches `@alkdev/taskgraph`'s validation pattern |
 
 The `source` is passed from the plugin entry to `createTools()` and stored in the registry for all operations to use.
 

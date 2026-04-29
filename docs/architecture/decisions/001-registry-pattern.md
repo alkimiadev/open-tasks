@@ -27,7 +27,7 @@ This follows the pattern established by open-memory, which exposes 9 operations 
 - `op` field name is unambiguous in OpenCode's context
 
 **Negative:**
-- The `op` and `args` fields are not individually validated by the outer schema — validation happens inside the dispatch handler
+- The `op` and `args` fields are not individually validated by the outer Zod schema — validation happens inside the dispatch handler
 - Agent must call help to discover operations; the tool description can only hint
 - Slightly more overhead per call (string dispatch vs direct function call)
 
@@ -35,6 +35,10 @@ This follows the pattern established by open-memory, which exposes 9 operations 
 - The `op` field description enumerates all operation names, so the LLM can dispatch correctly
 - Validation errors are clear and include usage guidance
 - The help operation provides complete reference with examples
+
+## Zod Requirement
+
+The tool args schema **must** use Zod because OpenCode's registry calls `z.object(def.args)` on every plugin tool definition. There is no JSON Schema alternative for tool definitions — this is the SDK's contract. TypeBox is used for internal config validation where we control the schema, but the tool definition boundary requires Zod. This is a small surface area (one schema for one tool) and doesn't extend beyond the `taskgraph` tool definition.
 
 ## Note on Schema Libraries
 
