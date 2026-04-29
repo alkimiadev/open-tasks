@@ -6,6 +6,7 @@
       "name": "@alkdev/open-tasks",
       "dependencies": {
         "@alkdev/taskgraph": "^0.0.2",
+        "@alkdev/typebox": "^0.34.49",
         "@opencode-ai/plugin": "^1.1.3",
       },
       "devDependencies": {

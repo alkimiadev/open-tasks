@@ -139,7 +139,8 @@ The `source.type` field is a discriminated union key. Each source type has its o
 ### Config Schema
 
 ```typescript
-import { Type, type Static, Union, Literal, Object, String, Optional } from "@alkdev/typebox"
+import { Type, type Static } from "@alkdev/typebox"
+import { Value } from "@alkdev/typebox/value"
 
 const FileSourceConfig = Type.Object({
   type: Type.Literal("file"),
@@ -274,7 +275,7 @@ function createSource(config: Config, workspaceDir: string): TaskSource {
 | `parallel` | `parallelGroups()` | — | Grouped task lists by generation |
 | `bottleneck` | `bottlenecks()` | — | Ranked task list with scores |
 | `risk` | `riskPath()`, `riskDistribution()` | — | Highest-risk path + distribution table |
-| `cost` | `workflowCost()` | `propagationMode`, `defaultQualityRetention`, `includeCompleted` | Per-task EV + totals |
+| `cost` | `workflowCost()` | `propagationMode`, `defaultQualityRetention`, `includeCompleted` (bundled into `WorkflowCostOptions`) | Per-task EV + totals |
 | `decompose` | `shouldDecomposeTask()` | `id` (required) | Decomposition verdict + reasons |
 
 ### Help Operation
@@ -314,7 +315,7 @@ function createSource(config: Config, workspaceDir: string): TaskSource {
 
 - **Context**: `workflowCost()` supports `propagationMode` (independent vs dag-propagate), `defaultQualityRetention`, and `includeCompleted`. Different defaults make sense for different workflows.
 - **Choice**: Default to `propagationMode: "dag-propagate"`, `includeCompleted: false`, `defaultQualityRetention: 0.9` — matching the Spec-Driven Development (SDD) process's assumption that completed tasks are factored out of remaining cost, and that quality degrades probabilistically across dependencies. See [SDD Process](../sdd_process.md) for the overall workflow.
-- **Consequences**: The most common use case (active project planning) gets sensible defaults. Agents can override per-call.
+- **Consequences**: The most common use case (active project planning) gets sensible defaults. Agents can override per-call. The `cost` operation collects these from `args` and constructs a `WorkflowCostOptions` object to pass to `workflowCost()`. The library applies defaults internally when fields are omitted — the plugin passes through user-provided values only, letting the library handle defaults.
 
 ### D6: Separate `registry.ts` From `tools.ts`
 
@@ -341,7 +342,6 @@ function createSource(config: Config, workspaceDir: string): TaskSource {
 ```typescript
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin"
 import { Value } from "@alkdev/typebox/value"
-import { ConfigSchema, type Config } from "./config.js"
 import { createSource } from "./sources/index.js"
 import { createTools } from "./tools.js"
 
@@ -385,18 +385,49 @@ The `source` is passed from the plugin entry to `createTools()` and stored in th
 
 ### Operation Handler Signature
 
-```typescript
-import type { PluginInput } from "@opencode-ai/plugin"
-import type { TaskSource } from "./sources/types.js"
+The OpenCode plugin SDK has two distinct context types that flow at different times:
 
+- **`PluginInput`** — available at plugin initialization, when the plugin function is called. Contains `client`, `project`, `directory`, `worktree`, `serverUrl`, `$`. This is where we capture the `source` and workspace paths.
+- **`ToolContext`** — available at tool execution time, when the LLM invokes the tool. Contains `sessionID`, `messageID`, `agent`, `directory`, `worktree`, `abort`, `metadata`, `ask`. This is per-invocation.
+
+The `source` and workspace info are captured from `PluginInput` via closure in `createTools()`. The `execute` handler receives `ToolContext` from OpenCode. Operations get the source through closure, not as a parameter:
+
+```typescript
+// tools.ts — createTools captures source via closure, matching open-memory's pattern
+function createTools(ctx: PluginInput, source: TaskSource) {
+  const registry = createRegistry(source, ctx.directory)
+
+  return {
+    taskgraph: tool({
+      description: "...",
+      args: { op: tool.schema.string(), args: tool.schema.record(tool.schema.string(), tool.schema.unknown()).optional() },
+      async execute(args, context: ToolContext) {
+        // context = ToolContext (sessionID, messageID, directory, worktree, abort, ...)
+        // source and workspaceDir are available via closure from createTools()
+        return registry.dispatch(args.op, args.args ?? {})
+      },
+    }),
+  }
+}
+
+// operations/*.ts — each handler is a closure over source
 type OperationHandler = (
   args: Record<string, unknown>,
-  source: TaskSource,
-  ctx: PluginInput,
 ) => string | Promise<string>
+
+// Example: list.ts
+export function createListHandler(source: TaskSource): OperationHandler {
+  return async (args) => {
+    const result = await source.load()
+    const graph = TaskGraph.fromTasks(result.tasks)
+    // ... filter, format, return
+  }
+}
 ```
 
-Each handler receives raw args (validated by the handler itself), the `TaskSource` for loading task data, and the plugin context. `PluginInput` provides `directory` (workspace root) and `worktree` path. Returns formatted markdown string.
+This matches how open-memory works: `createTools(ctx, tracker)` captures `ctx` and `tracker` as closures, and the `execute(input, context: ToolContext)` handler accesses them directly. The `ToolContext` is used only for per-request context like `sessionID` or `abort`.
+
+Path resolution uses `PluginInput.directory` (captured at init time) for `FileSource` construction, not `ToolContext.directory`. Both should point to the same project directory in practice, but the init-time capture is authoritative.
 
 ## Compatibility Surface
 
